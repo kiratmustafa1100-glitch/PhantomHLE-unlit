@@ -28,6 +28,11 @@ use crate::objc::{
     NSZonePtr,
 };
 
+// Ekleme: Aynı iş parçacığında sonsuz döngüye girilmesini önleyen Rust kilit mekanizması.
+thread_local! {
+    static IN_DELIVER_FAILURE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
 // NSError domain / code used when reporting "no network in emulator".
 const NS_URL_ERROR_DOMAIN: &str = "NSURLErrorDomain";
 const NS_URL_ERROR_NOT_CONNECTED_TO_INTERNET: i32 = -1009;
@@ -205,27 +210,16 @@ pub const CLASSES: ClassExports = objc_classes! {
                     delegate:delegate
             startImmediately:true]
 }
-    
+
 - (id)initWithRequest:(id)request
              delegate:(id)delegate
      startImmediately:(bool)start_immediately {
 
     if request == nil {
+        log!("NSURLConnection initWithRequest: nil request — returning nil");
         release(env, this);
         return nil;
     }
-
-    retain(env, delegate);
-    {
-        let host = env.objc.borrow_mut::<NSURLConnectionHostObject>(this);
-        host.delegate  = delegate;
-        host.cancelled = false;
-    }
-
-    // unlit
-
-    this
-}
 
     log_dbg!(
         "NSURLConnection initWithRequest:... delegate:... \
@@ -269,19 +263,32 @@ pub const CLASSES: ClassExports = objc_classes! {
     if delegate == nil {
         return;
     }
+
+    // Ekleme: Döngü kilidini kontrol et. Eğer zaten hata gönderiliyorsa ve oyun
+    // senkronize bir şekilde tekrar istek attıysa, derinlik patlamasını engellemek için durdur.
+    let is_recursive_loop = IN_DELIVER_FAILURE.with(|cell| {
+        if cell.get() {
+            true
+        } else {
+            cell.set(true);
+            false
+        }
+    });
+
+    if is_recursive_loop {
+        log!("NSURLConnection: Sonsuz döngü zinciri kırıldı. Çağrı yoksayılıyor.");
+        return;
+    }
+
     notify_delegate_failure(env, this, delegate);
+
+    // Ekleme: İşlem temiz bir şekilde bittiğinde kilidi kaldır.
+    IN_DELIVER_FAILURE.with(|cell| cell.set(false));
 }
 
 // MARK: - Instance methods
 
 - (())start {
-    //unlit
-    
-}
-
-    let sel = env.objc.register_host_selector("_touchHLE_deliverFailure".to_string(), &mut env.mem);
-    () = msg![env; this performSelector:sel withObject:nil afterDelay:0.0_f64];
-}
     log_dbg!(
         "NSURLConnection start: scheduling deferred failure \
          (networking not supported in touchHLE)"
