@@ -205,16 +205,34 @@ pub const CLASSES: ClassExports = objc_classes! {
                     delegate:delegate
             startImmediately:true]
 }
-
+    
 - (id)initWithRequest:(id)request
              delegate:(id)delegate
      startImmediately:(bool)start_immediately {
 
     if request == nil {
-        log!("NSURLConnection initWithRequest: nil request — returning nil");
         release(env, this);
         return nil;
     }
+
+    retain(env, delegate);
+    {
+        let host = env.objc.borrow_mut::<NSURLConnectionHostObject>(this);
+        host.delegate  = delegate;
+        host.cancelled = false;
+    }
+
+    if start_immediately {
+        if env.app_info.bundle_identifier == "com.outfit7.movingeye.swampattack" {
+            // Swamp Attack için hata bildirimi zamanlanmaz, bağlantı askıda bırakılır.
+        } else {
+            let sel = env.objc.register_host_selector("_touchHLE_deliverFailure".to_string(), &mut env.mem);
+            () = msg![env; this performSelector:sel withObject:nil afterDelay:0.0_f64];
+        }
+    }
+
+    this
+}
 
     log_dbg!(
         "NSURLConnection initWithRequest:... delegate:... \
@@ -264,6 +282,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Instance methods
 
 - (())start {
+    if env.app_info.bundle_identifier == "com.outfit7.movingeye.swampattack" {
+        // Swamp Attack için start çağrısı yoksayılır.
+        return;
+    }
+
+    let sel = env.objc.register_host_selector("_touchHLE_deliverFailure".to_string(), &mut env.mem);
+    () = msg![env; this performSelector:sel withObject:nil afterDelay:0.0_f64];
+}
     log_dbg!(
         "NSURLConnection start: scheduling deferred failure \
          (networking not supported in touchHLE)"
