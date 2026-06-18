@@ -222,14 +222,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         host.cancelled = false;
     }
 
-    if start_immediately {
-        if env.app_info.bundle_identifier == "com.outfit7.movingeye.swampattack" {
-            // Swamp Attack için hata bildirimi zamanlanmaz, bağlantı askıda bırakılır.
-        } else {
-            let sel = env.objc.register_host_selector("_touchHLE_deliverFailure".to_string(), &mut env.mem);
-            () = msg![env; this performSelector:sel withObject:nil afterDelay:0.0_f64];
-        }
-    }
+    // unlit
 
     this
 }
@@ -282,10 +275,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Instance methods
 
 - (())start {
-    if env.app_info.bundle_identifier == "com.outfit7.movingeye.swampattack" {
-        // Swamp Attack için start çağrısı yoksayılır.
-        return;
-    }
+    //unlit
+    
+}
 
     let sel = env.objc.register_host_selector("_touchHLE_deliverFailure".to_string(), &mut env.mem);
     () = msg![env; this performSelector:sel withObject:nil afterDelay:0.0_f64];
