@@ -28,9 +28,9 @@ use crate::objc::{
     NSZonePtr,
 };
 
-// Ekleme: Aynı iş parçacığında sonsuz döngüye girilmesini önleyen Rust kilit mekanizması.
+// Senkronize iç içe istek oluşturma derinliğini ölçen güvenli thread-local sayaç.
 thread_local! {
-    static IN_DELIVER_FAILURE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static CONNECTION_DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(0);
 }
 
 // NSError domain / code used when reporting "no network in emulator".
@@ -112,8 +112,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - canHandleRequest: (class method)
 
 + (bool)canHandleRequest:(id)_request {
-    // Advertise support so the app doesn't take a different code path;
-    // failure is reported via the delegate / error out-param instead.
     true
 }
 
@@ -125,8 +123,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     log!("NSURLConnection sendSynchronousRequest: stub called (returning empty data + error)");
 
-    // Even when request is nil we return non-nil NSData, because many
-    // callers do not nil-check the return value and crash otherwise.
     if request == nil {
         log!(
             "NSURLConnection sendSynchronousRequest: nil request — \
@@ -134,34 +130,21 @@ pub const CLASSES: ClassExports = objc_classes! {
         );
     }
 
-    // Write nil into *response (no HTTP response to report).
     if !response_ptr.is_null() {
         env.mem.write(response_ptr, nil);
     }
 
-    // Build and write an NSError so the caller knows why data is empty.
     if !error_ptr.is_null() {
         let error = make_network_error(env);
-        // make_network_error already autoreleased; retain once more so the
-        // caller owns a +1 ref through the out-pointer.
         retain(env, error);
         env.mem.write(error_ptr, error);
     }
 
-    // Always return empty NSData (never nil) to avoid null-deref crashes
-    // in callers that do not check the error out-pointer.
     let empty_data: id = msg_class![env; NSData data];
     empty_data
 }
 
 // MARK: - Asynchronous block API
-//
-// `+[NSURLConnection sendAsynchronousRequest:queue:completionHandler:]`
-// — iOS 5+ block-based convenience. touchHLE has no live network stack,
-// so we synthesise the "not connected to internet" error. The handler is
-// called with (nil, nil, error) as Apple documents for failure cases.
-// Games like Sonic Runners handle this gracefully — they show an error
-// dialog and allow the user to retry.
 
 + (())sendAsynchronousRequest:(id)request
                         queue:(id)queue
@@ -174,13 +157,9 @@ pub const CLASSES: ClassExports = objc_classes! {
          delivering NSURLErrorNotConnectedToInternet (touchHLE has no network)"
     );
 
-    // Build the failure NSError.
     let _ = request;
     let error = make_network_error(env);
 
-    // The completion handler is a `void (^)(NSURLResponse *, NSData *,
-    // NSError *)` block. ARM32 ABI: the block struct's third word
-    // (index 3 == byte offset 12) is the invoke function pointer.
     let invoke_ptr = env.mem.read(handler.cast::<u32>() + 3u32);
     if invoke_ptr == 0 {
         return;
@@ -189,7 +168,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     let invoke = crate::abi::GuestFunction::from_addr_with_thumb_bit(invoke_ptr);
 
     let _ = queue;
-    // Call with (nil_response, nil_data, error) — failure.
     let _: () = invoke.call_from_host(env, (handler, nil, nil, error));
 }
 
@@ -197,9 +175,24 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)connectionWithRequest:(id)request
                    delegate:(id)delegate {
+    // Derinlik sayacını artır ve kontrol et
+    let depth = CONNECTION_DEPTH.with(|cell| {
+        let d = cell.get();
+        cell.set(d + 1);
+        d
+    });
+
+    if depth > 10 {
+        log!("touchHLE::objc::messages: Warning: connectionWithRequest kısırdöngüsü başarıyla engellendi.");
+        CONNECTION_DEPTH.with(|cell| cell.set(cell.get().saturating_sub(1)));
+        return nil;
+    }
+
     let new: id = msg![env; this alloc];
     let new: id = msg![env; new initWithRequest:request delegate:delegate];
     autorelease(env, new);
+
+    CONNECTION_DEPTH.with(|cell| cell.set(cell.get().saturating_sub(1)));
     new
 }
 
@@ -221,6 +214,20 @@ pub const CLASSES: ClassExports = objc_classes! {
         return nil;
     }
 
+    // Derinlik sayacını artır ve kontrol et
+    let depth = CONNECTION_DEPTH.with(|cell| {
+        let d = cell.get();
+        cell.set(d + 1);
+        d
+    });
+
+    if depth > 10 {
+        log!("touchHLE::objc::messages: Warning: initWithRequest kısırdöngüsü başarıyla engellendi.");
+        CONNECTION_DEPTH.with(|cell| cell.set(cell.get().saturating_sub(1)));
+        release(env, this);
+        return nil;
+    }
+
     log_dbg!(
         "NSURLConnection initWithRequest:... delegate:... \
          startImmediately:{} (stub — failure via delegate)",
@@ -235,13 +242,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     if start_immediately {
-        // Per Apple's documentation, when startImmediately is YES the
-        // connection begins loading data immediately. Since touchHLE has
-        // no network stack, we schedule the delegate failure callback via
-        // performSelector:withObject:afterDelay: so that it fires on the
-        // next run-loop iteration rather than synchronously during init.
-        // This matches real iOS timing behavior — delegates are never
-        // called during the initializer itself.
         log_dbg!(
             "NSURLConnection: scheduling deferred failure notification \
              (networking not supported in touchHLE)"
@@ -250,10 +250,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         () = msg![env; this performSelector:sel withObject:nil afterDelay:0.0_f64];
     }
 
+    CONNECTION_DEPTH.with(|cell| cell.set(cell.get().saturating_sub(1)));
     this
 }
 
-// Internal helper method: delivers the failure callback to the delegate.
 - (())_touchHLE_deliverFailure {
     let host = env.objc.borrow::<NSURLConnectionHostObject>(this);
     if host.cancelled {
@@ -264,26 +264,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
 
-    // Ekleme: Döngü kilidini kontrol et. Eğer zaten hata gönderiliyorsa ve oyun
-    // senkronize bir şekilde tekrar istek attıysa, derinlik patlamasını engellemek için durdur.
-    let is_recursive_loop = IN_DELIVER_FAILURE.with(|cell| {
-        if cell.get() {
-            true
-        } else {
-            cell.set(true);
-            false
-        }
-    });
-
-    if is_recursive_loop {
-        log!("NSURLConnection: Sonsuz döngü zinciri kırıldı. Çağrı yoksayılıyor.");
-        return;
-    }
-
     notify_delegate_failure(env, this, delegate);
-
-    // Ekleme: İşlem temiz bir şekilde bittiğinde kilidi kaldır.
-    IN_DELIVER_FAILURE.with(|cell| cell.set(false));
 }
 
 // MARK: - Instance methods
