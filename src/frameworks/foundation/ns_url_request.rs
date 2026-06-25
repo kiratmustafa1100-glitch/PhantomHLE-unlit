@@ -34,30 +34,41 @@ const NSURLNetworkServiceTypeVoice: NSURLRequestNetworkServiceType = 4;
 
 #[derive(Default)]
 struct NSURLRequestHostObject {
-    /// `NSURL*`
     url: id,
-    /// `NSURL*` — main document URL for cookie policy
     main_document_url: id,
     cache_policy: NSURLRequestCachePolicy,
     timeout_interval: NSTimeInterval,
     network_service_type: NSURLRequestNetworkServiceType,
     allows_cellular_access: bool,
     handles_cookies: bool,
-    /// `NSString*`
     http_method: id,
-    /// Whether http_method was set by the caller (true) or is the default
-    /// static "GET" string (false). We must not release a static string.
     http_method_is_owned: bool,
-    /// `NSData*`
     http_body: id,
-    /// `NSInputStream*`
     http_body_stream: id,
     http_should_handle_cookies: bool,
     http_should_use_pipelining: bool,
-    /// `NSMutableDictionary<NSString*, NSString*>*`
     http_header_fields: id,
 }
 impl HostObject for NSURLRequestHostObject {}
+
+// --- Kısırdöngü Engelleyici Turnike Mekanizması ---
+std::thread_local! {
+    static REQUEST_DEPTH: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
+struct DepthGuard;
+impl DepthGuard {
+    fn new() -> Self {
+        REQUEST_DEPTH.with(|d| d.set(d.get() + 1));
+        Self
+    }
+}
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        REQUEST_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+// --------------------------------------------------
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -66,7 +77,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation NSURLRequest: NSObject
 
 + (id)allocWithZone:(NSZonePtr)_zone {
-    // Start with an owned, empty mutable dictionary for headers.
     let http_header_fields: id = msg_class![env; NSMutableDictionary new];
     let host_object = Box::new(NSURLRequestHostObject {
         url: nil,
@@ -76,7 +86,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         network_service_type: NSURLNetworkServiceTypeDefault,
         allows_cellular_access: true,
         handles_cookies: true,
-        // Static string — must NOT be released in dealloc.
         http_method: ns_string::get_static_str(env, "GET"),
         http_method_is_owned: false,
         http_body: nil,
@@ -99,6 +108,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)requestWithURL:(id)url
          cachePolicy:(NSURLRequestCachePolicy)cache_policy
      timeoutInterval:(NSTimeInterval)timeout_interval {
+    // Oyun içi paralel istekleri desteklemek için limit 32'ye çıkarıldı
+    let current_depth = REQUEST_DEPTH.with(|d| d.get());
+    if current_depth > 32 {
+        log_dbg!("⚠️ [Korumalı] NSURLRequest requestWithURL üst üste çok derin çağrıldı, kısırdöngü kırılıyor.");
+        return nil;
+    }
+    let _guard = DepthGuard::new();
+
     let new: id = msg![env; this alloc];
     let new: id = msg![env; new initWithURL:url
                                 cachePolicy:cache_policy
@@ -115,17 +132,18 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithURL:(id)url
       cachePolicy:(NSURLRequestCachePolicy)cache_policy
   timeoutInterval:(NSTimeInterval)timeout_interval {
+    let current_depth = REQUEST_DEPTH.with(|d| d.get());
+    if current_depth > 32 {
+        log_dbg!("⚠️ [Korumalı] NSURLRequest initWithURL üst üste çok derin çağrıldı, kısırdöngü kırılıyor.");
+        release(env, this);
+        return nil;
+    }
+    let _guard = DepthGuard::new();
+
     if url == nil {
         release(env, this);
         return nil;
     }
-
-    // NOTE: NSURLRequest is a pure value object (container for URL,
-    // headers, cache policy, etc.) per Apple's documentation:
-    // https://developer.apple.com/documentation/foundation/nsurlrequest
-    // It must ALWAYS succeed regardless of network availability.
-    // Network-level failures are reported later by NSURLConnection /
-    // NSURLSession when the request is actually executed.
 
     let url_copy: id = msg![env; url copy];
     {
@@ -141,15 +159,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     log_dbg!("[(NSURLRequest*){:?} dealloc]", this);
-    let host = env.objc.borrow::<NSURLRequestHostObject>(this);
-    let url               = host.url;
-    let main_document_url = host.main_document_url;
-    let http_body         = host.http_body;
-    let http_body_stream  = host.http_body_stream;
-    let http_header_fields = host.http_header_fields;
-    // Only release http_method if we own it (i.e. it was set by the caller,
-    // not the default static "GET" string from get_static_str).
-    let http_method         = if host.http_method_is_owned { host.http_method } else { nil };
+    
+    // Güvenli Ayrıştırma: borrow guard'ı izole bir blokta bitiriyoruz.
+    let (url, main_document_url, http_body, http_body_stream, http_header_fields, http_method) = {
+        let host = env.objc.borrow::<NSURLRequestHostObject>(this);
+        (
+            host.url,
+            host.main_document_url,
+            host.http_body,
+            host.http_body_stream,
+            host.http_header_fields,
+            if host.http_method_is_owned { host.http_method } else { nil }
+        )
+    }; // host borrow burada drop oldu. dealloc_object artık güvenli.
+
     release(env, url);
     release(env, main_document_url);
     release(env, http_method);
@@ -160,27 +183,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 // MARK: - copy / mutableCopy
-//
-// Both variants do a FULL copy of all fields, including headers, so that
-// the copy is fully independent of the original.
 
 - (id)copy {
     let new: id = msg_class![env; NSURLRequest alloc];
-    let host = env.objc.borrow::<NSURLRequestHostObject>(this);
-    let url = host.url;
-    let cp  = host.cache_policy;
-    let ti  = host.timeout_interval;
-    let nst = host.network_service_type;
-    let aca = host.allows_cellular_access;
-    let shc = host.http_should_handle_cookies;
-    let sup = host.http_should_use_pipelining;
-    let method      = host.http_method;
-    let method_owned = host.http_method_is_owned;
-    let body        = host.http_body;
-    let body_stream = host.http_body_stream;
-    let src_headers = host.http_header_fields;
+    
+    // Kilit çakışmasını önlemek için verileri izole blokta kopyalıyoruz
+    let (url, cp, ti, nst, aca, shc, sup, method, method_owned, body, body_stream, src_headers) = {
+        let host = env.objc.borrow::<NSURLRequestHostObject>(this);
+        (
+            host.url, host.cache_policy, host.timeout_interval, host.network_service_type,
+            host.allows_cellular_access, host.http_should_handle_cookies, host.http_should_use_pipelining,
+            host.http_method, host.http_method_is_owned, host.http_body, host.http_body_stream, host.http_header_fields
+        )
+    }; // 'this' kilidi açıldı.
 
-    // init sets url/cache_policy/timeout_interval; patch the rest manually.
     let new: id = msg![env; new initWithURL:url cachePolicy:cp timeoutInterval:ti];
     if new == nil { return nil; }
 
@@ -192,7 +208,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         h.http_should_use_pipelining = sup;
     }
 
-    // Copy HTTP method only if it was an owned (caller-set) string.
     if method_owned && method != nil {
         let method_copy: id = msg![env; method copy];
         let h = env.objc.borrow_mut::<NSURLRequestHostObject>(new);
@@ -200,19 +215,16 @@ pub const CLASSES: ClassExports = objc_classes! {
         h.http_method_is_owned = true;
     }
 
-    // Copy HTTP body.
     if body != nil {
         let body_copy: id = msg![env; body copy];
         env.objc.borrow_mut::<NSURLRequestHostObject>(new).http_body = body_copy;
     }
 
-    // Retain body stream (streams aren't generally copyable).
     if body_stream != nil {
         retain(env, body_stream);
         env.objc.borrow_mut::<NSURLRequestHostObject>(new).http_body_stream = body_stream;
     }
 
-    // Deep-copy the header dictionary so the copy is independent.
     if src_headers != nil {
         let old_headers = env.objc.borrow::<NSURLRequestHostObject>(new).http_header_fields;
         release(env, old_headers);
@@ -225,19 +237,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)mutableCopy {
     let new: id = msg_class![env; NSMutableURLRequest alloc];
-    let host = env.objc.borrow::<NSURLRequestHostObject>(this);
-    let url = host.url;
-    let cp  = host.cache_policy;
-    let ti  = host.timeout_interval;
-    let nst = host.network_service_type;
-    let aca = host.allows_cellular_access;
-    let shc = host.http_should_handle_cookies;
-    let sup = host.http_should_use_pipelining;
-    let method       = host.http_method;
-    let method_owned = host.http_method_is_owned;
-    let body         = host.http_body;
-    let body_stream  = host.http_body_stream;
-    let src_headers  = host.http_header_fields;
+    
+    let (url, cp, ti, nst, aca, shc, sup, method, method_owned, body, body_stream, src_headers) = {
+        let host = env.objc.borrow::<NSURLRequestHostObject>(this);
+        (
+            host.url, host.cache_policy, host.timeout_interval, host.network_service_type,
+            host.allows_cellular_access, host.http_should_handle_cookies, host.http_should_use_pipelining,
+            host.http_method, host.http_method_is_owned, host.http_body, host.http_body_stream, host.http_header_fields
+        )
+    }; // 'this' kilidi açıldı.
 
     let new: id = msg![env; new initWithURL:url cachePolicy:cp timeoutInterval:ti];
     if new == nil { return nil; }
@@ -329,7 +337,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow::<NSURLRequestHostObject>(this).http_header_fields
 }
 
-- (id)valueForHTTPHeaderField:(id)field { // NSString*
+- (id)valueForHTTPHeaderField:(id)field {
     let fields = env.objc.borrow::<NSURLRequestHostObject>(this).http_header_fields;
     msg![env; fields objectForKey:field]
 }
@@ -403,29 +411,35 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // MARK: HTTP setters
 
-- (())setHTTPMethod:(id)http_method { // NSString*
+- (())setHTTPMethod:(id)http_method {
     if http_method == nil { return; }
     let copy: id = msg![env; http_method copy];
-    let host = env.objc.borrow_mut::<NSURLRequestHostObject>(this);
-    // Only release the old value if we own it (not the default static string).
-    let old_owned = host.http_method_is_owned;
-    let old       = std::mem::replace(&mut host.http_method, copy);
-    host.http_method_is_owned = true;
+    
+    let (old, old_owned) = {
+        let host = env.objc.borrow_mut::<NSURLRequestHostObject>(this);
+        let old_owned = host.http_method_is_owned;
+        let old       = std::mem::replace(&mut host.http_method, copy);
+        host.http_method_is_owned = true;
+        (old, old_owned)
+    }; // borrow_mut drop edildi
+    
     if old_owned {
         release(env, old);
     }
 }
 
-- (())setHTTPBody:(id)http_body { // NSData*
+- (())setHTTPBody:(id)http_body {
     let copy: id = if http_body != nil { msg![env; http_body copy] } else { nil };
-    let old = std::mem::replace(
-        &mut env.objc.borrow_mut::<NSURLRequestHostObject>(this).http_body,
-        copy,
-    );
+    let old = {
+        std::mem::replace(
+            &mut env.objc.borrow_mut::<NSURLRequestHostObject>(this).http_body,
+            copy,
+        )
+    };
     release(env, old);
 }
 
-- (())setHTTPBodyStream:(id)stream { // NSInputStream*
+- (())setHTTPBodyStream:(id)stream {
     let old = env.objc.borrow::<NSURLRequestHostObject>(this).http_body_stream;
     release(env, old);
     if stream != nil { retain(env, stream); }
@@ -434,7 +448,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // MARK: Header fields
 
-- (())setValue:(id)value forHTTPHeaderField:(id)field { // NSString*, NSString*
+- (())setValue:(id)value forHTTPHeaderField:(id)field {
     if field == nil { return; }
     log_dbg!(
         "NSMutableURLRequest setValue:'{}' forHTTPHeaderField:'{}'",
@@ -445,12 +459,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     if value != nil {
         () = msg![env; fields setObject:value forKey:field];
     } else {
-        // setValue:nil means remove the field (per Apple docs).
         () = msg![env; fields removeObjectForKey:field];
     }
 }
 
-- (())addValue:(id)value forHTTPHeaderField:(id)field { // NSString*, NSString*
+- (())addValue:(id)value forHTTPHeaderField:(id)field {
     if field == nil || value == nil { return; }
     log_dbg!(
         "NSMutableURLRequest addValue:'{}' forHTTPHeaderField:'{}'",
@@ -458,7 +471,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         to_rust_string(env, field)
     );
     let fields = env.objc.borrow::<NSURLRequestHostObject>(this).http_header_fields;
-    // If a value already exists, append with comma per HTTP spec.
     let existing: id = msg![env; fields objectForKey:field];
     if existing != nil {
         let existing_str = to_rust_string(env, existing).into_owned();
@@ -467,7 +479,6 @@ pub const CLASSES: ClassExports = objc_classes! {
             env,
             format!("{}, {}", existing_str, new_str),
         );
-        // setObject:forKey: retains the value, so we autorelease our local ref.
         autorelease(env, combined);
         () = msg![env; fields setObject:combined forKey:field];
     } else {
@@ -475,7 +486,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
-- (())setAllHTTPHeaderFields:(id)header_fields { // NSDictionary*
+- (())setAllHTTPHeaderFields:(id)header_fields {
     let old = env.objc.borrow::<NSURLRequestHostObject>(this).http_header_fields;
     release(env, old);
     let copy: id = if header_fields != nil {
