@@ -194,6 +194,34 @@ fn objc_msgSend_inner(
     }
 
     let orig_class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
+
+    // =================================================================
+    // ADMARVEL KÖKTEN KURUTMA VE BYPASS YAMASI
+    // =================================================================
+    let sel_name = selector.as_str(&env.mem);
+    let mut is_admarvel = false;
+
+    // Mesajın gittiği sınıfın (Class) ismini kontrol edelim
+    if let Some(host_object) = env.objc.get_host_object(orig_class) {
+        if let Some(co) = host_object.as_any().downcast_ref::<super::ClassHostObject>() {
+            if co.name.starts_with("AdMarvel") {
+                is_admarvel = true;
+            }
+        }
+    }
+
+    // Eğer sınıf adı "AdMarvel" ile başlıyorsa veya çağrılan metot AdMarvel içeriyorsa engelle
+    if is_admarvel || sel_name.contains("AdMarvel") {
+        log!(
+            "⚠️ AdMarvel Bypass: [Metot: \"{}\"] çağrısı engellendi. Oyuna temiz (0) dönülüyor.",
+            sel_name
+        );
+        
+        // r0 ve r1 register'larını temizleyerek Objective-C dünyasına nil/0/false döneriz
+        env.cpu.regs_mut()[0..2].fill(0);
+        return; 
+    }
+    // =================================================================
     // Graceful exit if isa is nil — this typically means the object was
     // already deallocated (use-after-free in guest code) or was never
     // properly allocated. Per Apple's Objective-C runtime behavior,
