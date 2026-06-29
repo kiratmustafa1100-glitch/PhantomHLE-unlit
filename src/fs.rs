@@ -887,10 +887,55 @@ impl Fs {
         Ok(&self.working_directory)
     }
 
-    /// [Self::lookup_node] with a pre-resolved path.
+  /// [Self::lookup_node] with a pre-resolved path.
     fn lookup_node_inner(&self, resolved_path_components: &[&str]) -> Option<&FsNode> {
+        // Yönlendirme senaryosunda yeni yolu hafızada tutacak geçici değişkenler
+        let mut components_vec: Vec<&str>;
+        let mut components = resolved_path_components;
+
+        // --- Gelişmiş Dinamik Su Veritabanı Yönlendirme ve Kesinleştirme Kontrolü ---
+        // Eğer erişilmek istenen dosya "water.db" ise işlemleri başlat
+        if resolved_path_components.last() == Some(&"water.db") {
+            // Dosya bir .app (Bundle) klasörünün içinden mi çağrılıyor kontrol et
+            if let Some(app_idx) = resolved_path_components.iter().position(|c| c.ends_with(".app")) {
+                
+                // Sanal dosya sistemindeki güvenli (Yazılabilir) Library klasörünün VFS yolu
+                let library_vfs_path = ["var", "mobile", "Applications", "00000000-0000-0000-0000-000000000000", "Library"];
+                
+                // Canlı VFS ağacında dönerek Library düğümünü (node) buluyoruz
+                let mut current_node = &self.root;
+                for component in &library_vfs_path {
+                    if let FsNode::Directory { children, .. } = current_node {
+                        if let Some(next_node) = children.get(*component) {
+                            current_node = next_node;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                // Bulduğumuz Library klasörünün içindeki GERÇEK Android host yolunu (fiziksel klasörü) çekiyoruz
+                if let FsNode::Directory { writeable: Some(host_path), .. } = current_node {
+                    let real_db_path = host_path.join("water.db");
+                    
+                    // KESİNLEŞTİRME: Dosya gerçekten Android cihazında bu sandbox klasöründe var mı?
+                    if real_db_path.exists() {
+                        // Dosya fiziksel olarak varsa, yeni rotayı oluştur (Library/water.db)
+                        components_vec = resolved_path_components.to_vec();
+                        components_vec.truncate(app_idx); // .app ve sonrasındaki tüm yolu temizle
+                        components_vec.push("Library");
+                        components_vec.push("water.db");
+                        components = &components_vec; // Arama döngüsünün bu yeni yolu kullanmasını sağla
+                    }
+                }
+            }
+        }
+        // -------------------------------------------------------------------------
+
+        // Orijinal touchHLE Dosya Arama Döngüsü 
+        // (Artık yukarıdaki filtreden geçen güvenli 'components' değişkenini tarar)
         let mut node = &self.root;
-        for component in resolved_path_components {
+        for component in components {
             let FsNode::Directory {
                 children,
                 writeable: _,
@@ -898,7 +943,11 @@ impl Fs {
             else {
                 return None;
             };
-            node = children.get(*component)?
+            if let Some(next_node) = children.get(*component) {
+                node = next_node;
+            } else {
+                return None;
+            }
         }
         Some(node)
     }
