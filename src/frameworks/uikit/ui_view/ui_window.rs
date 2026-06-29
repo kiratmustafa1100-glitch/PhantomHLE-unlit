@@ -61,6 +61,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     // a notification.
     () = msg_super![env; this setHidden:true];
 
+    // Eklenen Düzeltme: Oyun 0x0 boyut gönderse bile pencere boyutunu her zaman ana ekranın (UIScreen) tam boyutuna zorlar.
+    let screen: id = msg_class![env; UIScreen mainScreen];
+    let screen_bounds: CGRect = msg![env; screen bounds];
+    let current_bounds: CGRect = msg![env; this bounds];
+    
+    if current_bounds.size != screen_bounds.size {
+        log_dbg!(
+            "UIWindow {:?}: overriding requested size {:?} with UIScreen.bounds size {:?}",
+            this,
+            current_bounds.size,
+            screen_bounds.size,
+        );
+        () = msg![env; this setFrame:screen_bounds];
+    }
+
     let list = &mut env.framework_state.uikit.ui_view.ui_window.windows;
     list.push(this);
     log_dbg!(
